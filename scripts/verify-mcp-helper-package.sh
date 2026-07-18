@@ -23,6 +23,7 @@ if [ -z "$COMMAND" ]; then
   echo "mcp_helper.json entry.command is empty" >&2
   exit 1
 fi
+
 if [[ "$COMMAND" = /* || "$COMMAND" == *".."* ]]; then
   echo "mcp_helper.json entry.command must stay inside package" >&2
   exit 1
