@@ -54,6 +54,8 @@ pub enum RemoteKey {
     KeySym(u32),
 }
 
+use crate::protocol::FrameRect;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum RemoteDesktopOutput {
@@ -66,6 +68,19 @@ pub enum RemoteDesktopOutput {
         width: u16,
         height: u16,
         rgba: Vec<u8>,
+    },
+    /// 整帧 BGRA（首帧/尺寸变化/大面积变化时）。
+    FrameBgra {
+        width: u16,
+        height: u16,
+        bgra: Vec<u8>,
+    },
+    /// 增量帧：若干脏矩形 + 拼接的 BGRA 字节。
+    FrameRectsBgra {
+        width: u16,
+        height: u16,
+        rects: Vec<FrameRect>,
+        bgra: Vec<u8>,
     },
     CursorDefault,
     CursorHidden,

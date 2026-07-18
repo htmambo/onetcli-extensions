@@ -169,6 +169,11 @@ impl VncClient {
             // 附加 ExtendedClipboard 伪编码，ARD 收到后不再推送普通帧（实测稳定复现
             // 收不到首帧）。标准 rfbServerCutText 回调不影响编码协商，剪贴板正常。
             (*client).GotXCutText = Some(got_xcut_text);
+            // 编码优先级：ZRLE/Tight 压缩优先，降低服务端→客户端的网络与解码开销。
+            // 注意：libvncclient 按【空格】分隔解析 encodingsString（strchr ' '），
+            // 用逗号会被当成单个编码名导致 "Unknown encoding"、编码协商失败黑屏。
+            // 用 'static 字面量，生命周期贯穿整个进程，libvncclient 只读不接管。
+            (*client).appData.encodingsString = c"zrle tight copyrect hextile raw".as_ptr();
             rfb::rfbClientSetClientData(client, ptr::null_mut(), ctx_ptr as *mut c_void);
 
             let ok = rfb::rfbInitClient(client, ptr::null_mut(), ptr::null_mut());

@@ -52,7 +52,10 @@ impl OutputSender {
             return Err(MailboxClosed);
         }
         match output {
-            frame @ RemoteDesktopOutput::Frame { .. } => state.latest_frame = Some(frame),
+            // 整帧可去重（只保留最新）；增量帧依赖前序底图，丢弃会残影，故按 control 全发。
+            frame @ (RemoteDesktopOutput::Frame { .. } | RemoteDesktopOutput::FrameBgra { .. }) => {
+                state.latest_frame = Some(frame)
+            }
             terminal @ (RemoteDesktopOutput::ConnectionFailure(_)
             | RemoteDesktopOutput::Terminated(_)) => {
                 state.latest_frame = None;

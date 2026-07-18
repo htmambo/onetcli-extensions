@@ -36,6 +36,24 @@ impl RgbaFramebuffer {
         bgra
     }
 
+    /// 导出指定矩形的 BGRA 像素（行优先，R/B 已互换）。越界返回 None。
+    pub fn clone_bgra_rect(&self, x: u16, y: u16, width: u16, height: u16) -> Option<Vec<u8>> {
+        if x.saturating_add(width) > self.width || y.saturating_add(height) > self.height {
+            return None;
+        }
+        let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+        for row in 0..height as usize {
+            let start = ((y as usize + row) * self.width as usize + x as usize) * 4;
+            let end = start + width as usize * 4;
+            let mut row_px = self.rgba[start..end].to_vec();
+            for pixel in row_px.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+            out.extend_from_slice(&row_px);
+        }
+        Some(out)
+    }
+
     pub fn patch_rgba_rect(
         &mut self,
         x: u16,

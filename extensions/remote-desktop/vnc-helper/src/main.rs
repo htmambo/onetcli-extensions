@@ -152,6 +152,26 @@ fn output_to_event(output: RemoteDesktopOutput) -> HelperEvent {
             height,
             rgba,
         } => HelperEvent::frame(width, height, rgba),
+        RemoteDesktopOutput::FrameBgra {
+            width,
+            height,
+            bgra,
+        } => HelperEvent::FrameBgraBytes {
+            width,
+            height,
+            bgra,
+        },
+        RemoteDesktopOutput::FrameRectsBgra {
+            width,
+            height,
+            rects,
+            bgra,
+        } => HelperEvent::FrameRectsBgra {
+            width,
+            height,
+            rects,
+            bgra,
+        },
         RemoteDesktopOutput::CursorDefault => HelperEvent::CursorDefault,
         RemoteDesktopOutput::CursorHidden => HelperEvent::CursorHidden,
         RemoteDesktopOutput::CursorPosition { x, y } => HelperEvent::CursorPosition { x, y },

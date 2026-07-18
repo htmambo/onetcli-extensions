@@ -66,6 +66,15 @@ pub struct ConnectRequest {
     pub height: u16,
 }
 
+/// 帧内一个脏矩形（增量更新区域）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum HelperEvent {
@@ -79,6 +88,13 @@ pub enum HelperEvent {
     FrameBgraBytes {
         width: u16,
         height: u16,
+        bgra: Vec<u8>,
+    },
+    /// 增量帧：整帧尺寸 + 若干脏矩形，bgra 为各矩形按顺序拼接的原始字节。
+    FrameRectsBgra {
+        width: u16,
+        height: u16,
+        rects: Vec<FrameRect>,
         bgra: Vec<u8>,
     },
     CursorDefault,
@@ -105,6 +121,14 @@ impl HelperEvent {
             height,
             bgra,
         }
+    }
+
+    /// 是否为携带二进制体的帧事件（整帧或增量帧）。
+    fn is_binary_frame(&self) -> bool {
+        matches!(
+            self,
+            HelperEvent::FrameBgraBytes { .. } | HelperEvent::FrameRectsBgra { .. }
+        )
     }
 }
 
@@ -134,7 +158,7 @@ pub fn decode_request_line(line: &str) -> anyhow::Result<HelperRequest> {
 }
 
 pub fn encode_event_line(event: &HelperEvent) -> anyhow::Result<String> {
-    if matches!(event, HelperEvent::FrameBgraBytes { .. }) {
+    if event.is_binary_frame() {
         anyhow::bail!("binary frame events must be written with write_event");
     }
     let mut line = serde_json::to_string(event)?;
@@ -162,6 +186,23 @@ where
             writer.write_all(line.as_bytes())?;
             writer.write_all(bgra)?;
         }
+        HelperEvent::FrameRectsBgra {
+            width,
+            height,
+            rects,
+            bgra,
+        } => {
+            let header = HelperFrameRectsBgraHeader {
+                width: *width,
+                height: *height,
+                rects: rects.clone(),
+                bgra_len: bgra.len(),
+            };
+            let mut line = serde_json::to_string(&header)?;
+            line.push('\n');
+            writer.write_all(line.as_bytes())?;
+            writer.write_all(bgra)?;
+        }
         event => writer.write_all(encode_event_line(event)?.as_bytes())?,
     }
     Ok(())
@@ -172,6 +213,15 @@ where
 struct HelperFrameBgraBytesHeader {
     width: u16,
     height: u16,
+    bgra_len: usize,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename = "FrameRectsBgra")]
+struct HelperFrameRectsBgraHeader {
+    width: u16,
+    height: u16,
+    rects: Vec<FrameRect>,
     bgra_len: usize,
 }
 
@@ -215,6 +265,60 @@ mod tests {
               \x33\x22\x11\xff\xef\xcd\xab\xff"
                 .to_vec()
         );
+    }
+
+    #[test]
+    fn writes_incremental_frame_rects_event_shape() {
+        let event = HelperEvent::FrameRectsBgra {
+            width: 4,
+            height: 4,
+            rects: vec![
+                FrameRect {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1,
+                },
+                FrameRect {
+                    x: 3,
+                    y: 3,
+                    width: 1,
+                    height: 2,
+                },
+            ],
+            bgra: vec![0x11, 0x22, 0x33, 0xff, 0xaa, 0xbb, 0xcc, 0xff, 0xdd, 0xee, 0x00, 0xff],
+        };
+        let mut output = Vec::new();
+
+        write_event(&mut output, &event).expect("event writes");
+
+        // 头为 JSON（含 rects 与 bgra_len），其后紧跟 bgra 二进制体。
+        let newline = output.iter().position(|b| *b == b'\n').expect("newline");
+        let header: serde_json::Value =
+            serde_json::from_slice(&output[..newline]).expect("header json");
+        assert_eq!(header["type"], "FrameRectsBgra");
+        assert_eq!(header["width"], 4);
+        assert_eq!(header["rects"].as_array().unwrap().len(), 2);
+        assert_eq!(header["rects"][1]["x"], 3);
+        assert_eq!(header["bgra_len"], 12);
+        assert_eq!(
+            &output[newline + 1..],
+            &[0x11, 0x22, 0x33, 0xff, 0xaa, 0xbb, 0xcc, 0xff, 0xdd, 0xee, 0x00, 0xff]
+        );
+    }
+
+    #[test]
+    fn rejects_incremental_frame_event_as_json_line() {
+        let event = HelperEvent::FrameRectsBgra {
+            width: 1,
+            height: 1,
+            rects: vec![],
+            bgra: vec![],
+        };
+
+        let error = encode_event_line(&event).expect_err("binary frame is not a JSON line");
+
+        assert!(error.to_string().contains("write_event"));
     }
 
     #[test]
