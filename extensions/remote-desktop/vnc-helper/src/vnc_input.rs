@@ -1,7 +1,13 @@
-use vnc_client::{ClientMouseEvent, VncClient, X11Event};
+//! 输入处理：把 `RemoteDesktopInput` 转成 libvncclient 的键鼠/剪贴板调用。
+//!
+//! 与原 vnc-rs 版本的区别：输入不再经 `VncClient::input(X11Event)`，而是直接调
+//! `vnc_client::VncClient` 的 `send_key`/`send_pointer`/`send_cut_text`。
+//! 指针按钮/滚轮 mask 逻辑（`VncPointerState`）与按键 keysym 映射（`vnc_keyboard`）
+//! 与库无关，原样保留。
 
 use crate::output_mailbox::OutputSender;
 use crate::runtime::{RemoteDesktopInput, RemoteDesktopOutput, RemoteMouseButton};
+use crate::vnc_client::VncClient;
 use crate::vnc_keyboard::remote_key_to_keysym;
 
 const MAX_INPUTS_PER_POLL: usize = 256;
@@ -14,8 +20,8 @@ pub(crate) enum VncInputAction {
     Failed(String),
 }
 
-pub(crate) async fn handle_pending_inputs(
-    client: &VncClient,
+pub(crate) fn handle_pending_inputs(
+    client: &mut VncClient,
     latest_clipboard_text: &mut Option<String>,
     input_rx: &mut tokio::sync::mpsc::UnboundedReceiver<RemoteDesktopInput>,
     pointer: &mut VncPointerState,
@@ -26,8 +32,7 @@ pub(crate) async fn handle_pending_inputs(
         VncInputBatch::Disconnected => return VncInputAction::InputClosed,
     };
     for input in inputs {
-        let action =
-            handle_vnc_input(client, latest_clipboard_text, pointer, input, output_tx).await;
+        let action = handle_vnc_input(client, latest_clipboard_text, pointer, input, output_tx);
         if !matches!(action, VncInputAction::Continue) {
             return action;
         }
@@ -35,108 +40,66 @@ pub(crate) async fn handle_pending_inputs(
     VncInputAction::Continue
 }
 
-async fn handle_vnc_input(
-    client: &VncClient,
+fn handle_vnc_input(
+    client: &mut VncClient,
     latest_clipboard_text: &mut Option<String>,
     pointer: &mut VncPointerState,
     input: RemoteDesktopInput,
     output_tx: &OutputSender,
 ) -> VncInputAction {
-    match send_vnc_input(client, latest_clipboard_text, pointer, input, output_tx).await {
+    match send_vnc_input(client, latest_clipboard_text, pointer, input, output_tx) {
         Ok(action) => action,
         Err(error) => VncInputAction::Failed(error.to_string()),
     }
 }
 
-async fn send_vnc_input(
-    client: &VncClient,
+fn send_vnc_input(
+    client: &mut VncClient,
     latest_clipboard_text: &mut Option<String>,
     pointer: &mut VncPointerState,
     input: RemoteDesktopInput,
     output_tx: &OutputSender,
 ) -> anyhow::Result<VncInputAction> {
     match input {
-        RemoteDesktopInput::Close => close_client(client).await,
-        RemoteDesktopInput::Reconnect => reconnect_client(client).await,
-        RemoteDesktopInput::MouseMove { x, y } => move_pointer(client, pointer, x, y).await,
+        RemoteDesktopInput::Close => Ok(VncInputAction::Closed),
+        RemoteDesktopInput::Reconnect => Ok(VncInputAction::Reconnect),
+        RemoteDesktopInput::MouseMove { x, y } => {
+            pointer.move_to(x, y);
+            send_pointer_event(client, pointer);
+            Ok(VncInputAction::Continue)
+        }
         RemoteDesktopInput::MouseButton { button, pressed } => {
-            update_button(client, pointer, button, pressed).await
+            pointer.set_button(button, pressed);
+            send_pointer_event(client, pointer);
+            Ok(VncInputAction::Continue)
         }
         RemoteDesktopInput::Wheel { vertical, units } => {
-            send_wheel_events(client, pointer, vertical, units).await
+            let (x, y, _) = pointer.snapshot();
+            for mask in pointer.wheel_masks(vertical, units) {
+                client.send_pointer(x, y, mask);
+            }
+            Ok(VncInputAction::Continue)
         }
         RemoteDesktopInput::Key { key, pressed } => {
             if let Some(keysym) = remote_key_to_keysym(&key) {
-                client
-                    .input(X11Event::KeyEvent((keysym, pressed).into()))
-                    .await?;
+                client.send_key(keysym, pressed);
             }
             Ok(VncInputAction::Continue)
         }
         RemoteDesktopInput::ClipboardText { text } | RemoteDesktopInput::Text { text } => {
-            send_clipboard_text(client, latest_clipboard_text, text, output_tx).await
+            send_clipboard_text(client, latest_clipboard_text, text, output_tx)
         }
         RemoteDesktopInput::Resize { .. } => Ok(VncInputAction::Continue),
     }
 }
 
-async fn close_client(client: &VncClient) -> anyhow::Result<VncInputAction> {
-    let _ = client.close().await;
-    Ok(VncInputAction::Closed)
-}
-
-async fn reconnect_client(client: &VncClient) -> anyhow::Result<VncInputAction> {
-    let _ = client.close().await;
-    Ok(VncInputAction::Reconnect)
-}
-
-async fn move_pointer(
-    client: &VncClient,
-    pointer: &mut VncPointerState,
-    x: u16,
-    y: u16,
-) -> anyhow::Result<VncInputAction> {
-    pointer.move_to(x, y);
-    send_pointer_event(client, pointer).await?;
-    Ok(VncInputAction::Continue)
-}
-
-async fn update_button(
-    client: &VncClient,
-    pointer: &mut VncPointerState,
-    button: RemoteMouseButton,
-    pressed: bool,
-) -> anyhow::Result<VncInputAction> {
-    pointer.set_button(button, pressed);
-    send_pointer_event(client, pointer).await?;
-    Ok(VncInputAction::Continue)
-}
-
-async fn send_pointer_event(client: &VncClient, pointer: &VncPointerState) -> anyhow::Result<()> {
+fn send_pointer_event(client: &mut VncClient, pointer: &VncPointerState) {
     let (x, y, mask) = pointer.snapshot();
-    client
-        .input(X11Event::PointerEvent(ClientMouseEvent::from((x, y, mask))))
-        .await?;
-    Ok(())
+    client.send_pointer(x, y, mask);
 }
 
-async fn send_wheel_events(
-    client: &VncClient,
-    pointer: &VncPointerState,
-    vertical: bool,
-    units: i16,
-) -> anyhow::Result<VncInputAction> {
-    let (x, y, _) = pointer.snapshot();
-    for mask in pointer.wheel_masks(vertical, units) {
-        client
-            .input(X11Event::PointerEvent(ClientMouseEvent::from((x, y, mask))))
-            .await?;
-    }
-    Ok(VncInputAction::Continue)
-}
-
-async fn send_clipboard_text(
-    client: &VncClient,
+fn send_clipboard_text(
+    client: &mut VncClient,
     latest_clipboard_text: &mut Option<String>,
     text: String,
     output_tx: &OutputSender,
@@ -149,7 +112,7 @@ async fn send_clipboard_text(
         return Ok(VncInputAction::Continue);
     }
     *latest_clipboard_text = Some(text.clone());
-    client.input(X11Event::CopyText(text)).await?;
+    client.send_cut_text(&text);
     Ok(VncInputAction::Continue)
 }
 

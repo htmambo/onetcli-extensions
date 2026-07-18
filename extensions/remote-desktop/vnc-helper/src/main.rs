@@ -16,6 +16,7 @@ mod framebuffer;
 mod output_mailbox;
 mod protocol;
 mod runtime;
+mod vnc_client;
 mod vnc_encoding;
 mod vnc_input;
 mod vnc_keyboard;
@@ -71,6 +72,7 @@ fn read_connect_request(
 fn connect_options(connect: protocol::ConnectRequest) -> RemoteDesktopConnectionOptions {
     RemoteDesktopConnectionOptions {
         destination: connect.destination,
+        username: connect.username,
         password: connect.password,
     }
 }

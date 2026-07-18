@@ -1,6 +1,7 @@
 #[derive(Clone)]
 pub struct RemoteDesktopConnectionOptions {
     pub destination: String,
+    pub username: Option<String>,
     pub password: Option<String>,
 }
 
