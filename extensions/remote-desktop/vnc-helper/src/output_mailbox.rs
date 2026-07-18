@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
+use crate::protocol::FrameRect;
 use crate::runtime::RemoteDesktopOutput;
 
 pub struct OutputSender {
@@ -20,9 +21,18 @@ struct Shared {
     ready: Condvar,
 }
 
+/// 累积的增量帧（合并去重，防止无界积压）。
+struct PendingIncremental {
+    width: u16,
+    height: u16,
+    rects: Vec<FrameRect>,
+    bgra: Vec<u8>,
+}
+
 struct State {
     control: VecDeque<RemoteDesktopOutput>,
     latest_frame: Option<RemoteDesktopOutput>,
+    pending_incremental: Option<PendingIncremental>,
     sender_count: usize,
     receiver_alive: bool,
 }
@@ -32,6 +42,7 @@ pub fn output_mailbox() -> (OutputSender, OutputReceiver) {
         state: Mutex::new(State {
             control: VecDeque::new(),
             latest_frame: None,
+            pending_incremental: None,
             sender_count: 1,
             receiver_alive: true,
         }),
@@ -52,13 +63,43 @@ impl OutputSender {
             return Err(MailboxClosed);
         }
         match output {
-            // 整帧可去重（只保留最新）；增量帧依赖前序底图，丢弃会残影，故按 control 全发。
+            // 整帧可去重（只保留最新）；整帧覆盖后废除已累积的增量帧（其内容已过时）。
             frame @ (RemoteDesktopOutput::Frame { .. } | RemoteDesktopOutput::FrameBgra { .. }) => {
-                state.latest_frame = Some(frame)
+                state.latest_frame = Some(frame);
+                state.pending_incremental = None;
             }
+            // 增量帧合并到单一 pending（防无界积压）。rects/bgra 按序 append，
+            // 主程序按序 patch（后写覆盖先写），语义与逐帧发送等价。
+            RemoteDesktopOutput::FrameRectsBgra {
+                width,
+                height,
+                rects,
+                bgra,
+            } => match &mut state.pending_incremental {
+                Some(p) if p.width == width && p.height == height => {
+                    p.rects.extend(rects);
+                    p.bgra.extend(bgra);
+                    // 消费端异常缓慢时给出观测点（正常一个 tick 内取走清空）。
+                    if p.bgra.len() > 32 * 1024 * 1024 {
+                        tracing::warn!(
+                            pending_len = p.bgra.len(),
+                            "pending incremental frame too large; consumer may be stuck"
+                        );
+                    }
+                }
+                _ => {
+                    state.pending_incremental = Some(PendingIncremental {
+                        width,
+                        height,
+                        rects,
+                        bgra,
+                    });
+                }
+            },
             terminal @ (RemoteDesktopOutput::ConnectionFailure(_)
             | RemoteDesktopOutput::Terminated(_)) => {
                 state.latest_frame = None;
+                state.pending_incremental = None;
                 state.control.push_back(terminal);
             }
             control => state.control.push_back(control),
@@ -100,6 +141,14 @@ impl OutputReceiver {
             if let Some(frame) = state.latest_frame.take() {
                 return Some(frame);
             }
+            if let Some(p) = state.pending_incremental.take() {
+                return Some(RemoteDesktopOutput::FrameRectsBgra {
+                    width: p.width,
+                    height: p.height,
+                    rects: p.rects,
+                    bgra: p.bgra,
+                });
+            }
             if state.sender_count == 0 {
                 return None;
             }
@@ -118,6 +167,7 @@ impl Drop for OutputReceiver {
         state.receiver_alive = false;
         state.control.clear();
         state.latest_frame = None;
+        state.pending_incremental = None;
         drop(state);
         self.shared.ready.notify_all();
     }
@@ -221,5 +271,97 @@ mod tests {
             height: 1,
             rgba: vec![value, 0, 0, 255],
         }
+    }
+
+    fn rect(x: u16, y: u16, w: u16, h: u16) -> FrameRect {
+        FrameRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
+    fn incr(rects: Vec<FrameRect>, bgra: Vec<u8>) -> RemoteDesktopOutput {
+        RemoteDesktopOutput::FrameRectsBgra {
+            width: 4,
+            height: 4,
+            rects,
+            bgra,
+        }
+    }
+
+    #[test]
+    fn merges_consecutive_incremental_frames_into_one() {
+        let (tx, rx) = output_mailbox();
+        tx.send(incr(vec![rect(0, 0, 1, 1)], vec![1, 0, 0, 255])).unwrap();
+        tx.send(incr(vec![rect(3, 3, 1, 1)], vec![2, 0, 0, 255])).unwrap();
+
+        // 两个增量帧合并为一个（rects/bgra 按序拼接）。
+        match rx.recv() {
+            Some(RemoteDesktopOutput::FrameRectsBgra { rects, bgra, .. }) => {
+                assert_eq!(rects, vec![rect(0, 0, 1, 1), rect(3, 3, 1, 1)]);
+                assert_eq!(bgra, vec![1, 0, 0, 255, 2, 0, 0, 255]);
+            }
+            other => panic!("expected merged incremental frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_frame_discards_pending_incremental() {
+        let (tx, rx) = output_mailbox();
+        tx.send(incr(vec![rect(0, 0, 1, 1)], vec![1, 0, 0, 255])).unwrap();
+        tx.send(frame(9)).unwrap(); // 整帧覆盖，废除 pending 增量
+
+        assert_eq!(Some(frame(9)), rx.recv());
+        drop(tx);
+        assert_eq!(None, rx.recv()); // pending 增量已被废除，不会再发出
+    }
+
+    #[test]
+    fn size_change_restarts_pending_incremental() {
+        let (tx, rx) = output_mailbox();
+        tx.send(RemoteDesktopOutput::FrameRectsBgra {
+            width: 4,
+            height: 4,
+            rects: vec![rect(0, 0, 1, 1)],
+            bgra: vec![1, 0, 0, 255],
+        })
+        .unwrap();
+        // 尺寸不同的增量帧到来 → 旧的被替换（不混拼）。
+        tx.send(RemoteDesktopOutput::FrameRectsBgra {
+            width: 8,
+            height: 8,
+            rects: vec![rect(2, 2, 1, 1)],
+            bgra: vec![2, 0, 0, 255],
+        })
+        .unwrap();
+
+        match rx.recv() {
+            Some(RemoteDesktopOutput::FrameRectsBgra {
+                width,
+                height,
+                rects,
+                bgra,
+            }) => {
+                assert_eq!((width, height), (8, 8));
+                assert_eq!(rects, vec![rect(2, 2, 1, 1)]);
+                assert_eq!(bgra, vec![2, 0, 0, 255]);
+            }
+            other => panic!("expected size-restarted incremental, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_event_between_incrementals_is_delivered_first() {
+        let (tx, rx) = output_mailbox();
+        tx.send(incr(vec![rect(0, 0, 1, 1)], vec![1, 0, 0, 255])).unwrap();
+        tx.send(RemoteDesktopOutput::Status("s".into())).unwrap();
+
+        assert_eq!(Some(RemoteDesktopOutput::Status("s".into())), rx.recv());
+        assert!(matches!(
+            rx.recv(),
+            Some(RemoteDesktopOutput::FrameRectsBgra { .. })
+        ));
     }
 }
